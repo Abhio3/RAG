@@ -1,5 +1,7 @@
-import { useRef, useState, useEffect, type FormEvent } from "react";
-import { streamChat, getMessages } from "../api";
+import { useRef, useState, useEffect, type FormEvent, type ChangeEvent } from "react";
+import { streamChat, getMessages, uploadFile, getDocuments } from "../api";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 type Message = { role: "user" | "assistant"; content: string };
 
@@ -12,27 +14,59 @@ export default function ChatPanel({ chatId, onChatChanged }: Props) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [sessionDocs, setSessionDocs] = useState<string[]>([]);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Load an existing thread when one is selected; clear for a new chat.
   useEffect(() => {
+    setSessionDocs([]);
     if (!chatId) {
       setMessages([]);
       return;
     }
-    getMessages(chatId)
-      .then((rows) => setMessages(rows.map((r) => ({ role: r.role, content: r.content }))))
-      .catch(() => setMessages([]));
+    
+    Promise.all([
+      getMessages(chatId),
+      getDocuments(chatId)
+    ]).then(([msgRows, docRows]) => {
+      setMessages(msgRows.map((r) => ({ role: r.role, content: r.content })));
+      setSessionDocs(docRows.map((d) => d.filename));
+    }).catch(() => {
+      setMessages([]);
+      setSessionDocs([]);
+    });
   }, [chatId]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, loading]);
+  }, [messages, loading, sessionDocs]);
 
-  async function onSubmit(e: FormEvent) {
-    e.preventDefault();
+  async function handleFileUpload(e: ChangeEvent<HTMLInputElement>) {
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
+    setUploading(true);
+    let currentChatId = chatId;
+    for (const file of Array.from(files)) {
+      try {
+        const res = await uploadFile(file, currentChatId);
+        if (res.chat_id && res.chat_id !== currentChatId) {
+          currentChatId = res.chat_id;
+          onChatChanged(res.chat_id);
+        }
+        setSessionDocs(prev => [...prev, res.filename]);
+      } catch (err) {
+        setMessages((m) => [...m, { role: "assistant", content: `⚠️ Upload failed: ${(err as Error).message}` }]);
+      }
+    }
+    setUploading(false);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  }
+
+  async function onSubmit(e?: FormEvent) {
+    if (e) e.preventDefault();
     const question = input.trim();
-    if (!question || loading) return;
+    if (!question || loading || uploading) return;
 
     setInput("");
     setMessages((m) => [...m, { role: "user", content: question }]);
@@ -55,7 +89,6 @@ export default function ChatPanel({ chatId, onChatChanged }: Props) {
         });
       });
       if (newId && newId !== chatId) onChatChanged(newId);
-      else onChatChanged(newId || chatId || "");
     } catch (err) {
       setMessages((m) => [
         ...m,
@@ -67,12 +100,32 @@ export default function ChatPanel({ chatId, onChatChanged }: Props) {
   }
 
   return (
-    <>
+    <div className="flex h-full flex-col">
       <div className="flex-1 space-y-4 overflow-y-auto p-6">
         {messages.length === 0 && (
-          <p className="mt-20 text-center text-sm text-neutral-600">
-            Upload a document, then ask a question about it.
-          </p>
+          <div className="mt-32 flex flex-col items-center justify-center">
+            <h2 className="mb-2 text-2xl font-semibold">How can I help you today?</h2>
+            <p className="text-center text-sm text-neutral-500">
+              Upload a document to chat with it exclusively.
+            </p>
+          </div>
+        )}
+        {messages.length > 0 && sessionDocs.length > 0 && (
+          <div className="flex justify-end mb-6">
+            <div className="flex flex-col items-end gap-2">
+              <span className="text-[10px] text-neutral-500 font-bold uppercase tracking-wider">Context Files</span>
+              <div className="flex flex-wrap gap-2 justify-end">
+                {sessionDocs.map((doc, idx) => (
+                  <div key={idx} className="flex items-center gap-1.5 rounded-xl bg-neutral-800 px-3 py-2 text-xs text-neutral-300 ring-1 ring-neutral-700">
+                    <svg className="h-4 w-4 text-blue-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                    </svg>
+                    <span className="truncate max-w-[200px] font-medium">{doc}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
         )}
         {messages.map((m, i) => (
           <div
@@ -80,44 +133,107 @@ export default function ChatPanel({ chatId, onChatChanged }: Props) {
             className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}
           >
             <div
-              className={`max-w-[75%] whitespace-pre-wrap rounded-2xl px-4 py-2 text-sm ${
+              className={`max-w-[75%] px-5 py-3 prose prose-sm max-w-none ${
                 m.role === "user"
-                  ? "bg-blue-600 text-white"
-                  : "bg-neutral-800 text-neutral-100"
+                  ? "rounded-3xl bg-neutral-800 text-neutral-100 prose-invert prose-p:leading-snug"
+                  : "text-neutral-100 prose-invert prose-p:leading-relaxed prose-pre:bg-neutral-900 prose-pre:border prose-pre:border-neutral-800 prose-pre:rounded-xl prose-a:text-blue-400"
               }`}
             >
-              {m.content}
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                {m.content}
+              </ReactMarkdown>
             </div>
           </div>
         ))}
         {loading && messages[messages.length - 1]?.role === "user" && (
           <div className="flex justify-start">
-            <div className="animate-pulse rounded-2xl bg-neutral-800 px-4 py-2 text-sm text-neutral-400">
-              Analyzing document…
+            <div className="animate-pulse px-4 py-2 text-[15px] text-neutral-400">
+              Thinking…
             </div>
           </div>
         )}
         <div ref={bottomRef} />
       </div>
 
-      <form
-        onSubmit={onSubmit}
-        className="flex gap-2 border-t border-neutral-800 p-4"
-      >
-        <input
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          placeholder="Ask a question…"
-          className="flex-1 rounded-md bg-neutral-900 px-4 py-2 text-sm outline-none ring-1 ring-neutral-800 focus:ring-blue-600"
-        />
-        <button
-          type="submit"
-          disabled={loading || !input.trim()}
-          className="rounded-md bg-blue-600 px-5 py-2 text-sm font-medium hover:bg-blue-500 disabled:opacity-50"
-        >
-          Send
-        </button>
-      </form>
-    </>
+      <div className="p-4">
+        <div className="mx-auto max-w-3xl rounded-3xl bg-neutral-900 ring-1 ring-neutral-800 focus-within:ring-neutral-700">
+          
+          {sessionDocs.length > 0 && (
+            <div className="flex flex-wrap gap-2 p-3 pb-0 px-4">
+              {sessionDocs.map((doc, idx) => (
+                <div key={idx} className="flex items-center gap-1.5 rounded-lg bg-neutral-800 px-3 py-1.5 text-xs text-neutral-300">
+                  <svg className="h-3.5 w-3.5 text-blue-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                  </svg>
+                  <span className="truncate max-w-[150px]">{doc}</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <form
+            onSubmit={onSubmit}
+            className="flex items-end gap-2 p-3"
+          >
+            <input
+              ref={fileInputRef}
+              type="file"
+              multiple
+              className="hidden"
+              onChange={handleFileUpload}
+            />
+            <button
+              type="button"
+              disabled={uploading}
+              onClick={() => fileInputRef.current?.click()}
+              className="rounded-full p-2 text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200 disabled:opacity-50"
+              title="Upload document"
+            >
+              {uploading ? (
+                <svg className="h-6 w-6 animate-spin text-neutral-500" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+              ) : (
+                <svg className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" />
+                </svg>
+              )}
+            </button>
+
+            <textarea
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  if (input.trim() && !loading && !uploading) onSubmit();
+                }
+              }}
+              placeholder="Ask a question…"
+              className="max-h-60 min-h-[44px] flex-1 resize-none bg-transparent py-2 text-[15px] text-neutral-100 outline-none placeholder:text-neutral-500"
+              rows={1}
+            />
+            
+            <button
+              type="submit"
+              disabled={loading || !input.trim() || uploading}
+              className={`rounded-full p-2 transition-colors ${
+                input.trim() && !loading && !uploading
+                  ? "bg-neutral-100 text-neutral-900 hover:bg-neutral-300"
+                  : "bg-neutral-800 text-neutral-500"
+              }`}
+            >
+              <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 19V6m0 0l-8 8m8-8l8 8" />
+              </svg>
+            </button>
+          </form>
+        </div>
+        <p className="mt-3 text-center text-xs text-neutral-500">
+          AI can make mistakes. Check important info.
+        </p>
+      </div>
+    </div>
   );
 }

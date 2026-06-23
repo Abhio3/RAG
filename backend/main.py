@@ -10,8 +10,10 @@ from fastapi.responses import StreamingResponse
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from PyPDF2 import PdfReader
 from pydantic import BaseModel
-from qdrant_client import QdrantClient
+from qdrant_client import QdrantClient, models
 from qdrant_client.models import Distance, PointStruct, VectorParams
+import pandas as pd
+from docx import Document
 
 load_dotenv()  # read backend/.env (Supabase keys)
 
@@ -71,8 +73,17 @@ def extract_text(filename: str, data: bytes) -> str:
         text = "\n".join(page.extract_text() or "" for page in reader.pages)
     elif name.endswith(".txt"):
         text = data.decode("utf-8", errors="ignore")
+    elif name.endswith(".csv"):
+        df = pd.read_csv(BytesIO(data))
+        text = df.to_markdown(index=False)
+    elif name.endswith(".xlsx"):
+        df = pd.read_excel(BytesIO(data))
+        text = df.to_markdown(index=False)
+    elif name.endswith(".docx"):
+        doc = Document(BytesIO(data))
+        text = "\n".join(p.text for p in doc.paragraphs)
     else:
-        raise HTTPException(status_code=400, detail="Only PDF and TXT files are supported.")
+        raise HTTPException(status_code=400, detail="Only PDF, TXT, CSV, XLSX, and DOCX files are supported.")
     return text.replace("\x00", "")
 
 
@@ -85,6 +96,7 @@ def health() -> dict:
 async def upload(
     file: UploadFile = File(...),
     tags: str = Form(""),
+    chat_id: str = Form(None),
 ) -> dict:
     data = await file.read()
     text = extract_text(file.filename, data)
@@ -92,12 +104,15 @@ async def upload(
     if not chunks:
         raise HTTPException(status_code=400, detail="No extractable text found.")
 
+    if not chat_id:
+        chat_id = str(db.create_chat(title=f"Chat about {file.filename}")["id"])
+
     # Index chunks for vector search in Qdrant.
     points = [
         PointStruct(
             id=str(uuid.uuid4()),
             vector=embed(chunk),
-            payload={"text": chunk, "filename": file.filename},
+            payload={"text": chunk, "filename": file.filename, "chat_id": chat_id},
         )
         for chunk in chunks
     ]
@@ -106,6 +121,7 @@ async def upload(
     # Persist the file + metadata in Postgres.
     tag_list = [t.strip() for t in tags.split(",") if t.strip()]
     doc = db.insert_document(
+        chat_id=chat_id,
         filename=file.filename,
         content=text,
         tags=tag_list,
@@ -115,15 +131,18 @@ async def upload(
     )
     return {
         "id": str(doc["id"]),
+        "chat_id": chat_id,
         "filename": file.filename,
         "chunks": len(chunks),
         "tags": tag_list,
     }
 
 
+from typing import Optional
+
 @app.get("/documents")
-def documents() -> list[dict]:
-    return db.list_documents()
+def documents(chat_id: Optional[str] = None) -> list[dict]:
+    return db.list_documents(chat_id)
 
 
 # --- Chat ------------------------------------------------------------------
@@ -159,6 +178,9 @@ def chat(req: ChatRequest) -> StreamingResponse:
     hits = qdrant.query_points(
         collection_name=COLLECTION,
         query=embed(question),
+        query_filter=models.Filter(
+            must=[models.FieldCondition(key="chat_id", match=models.MatchValue(value=chat_id))]
+        ),
         limit=TOP_K,
         with_payload=True,
     ).points

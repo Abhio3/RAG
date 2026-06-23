@@ -7,3 +7,7 @@ pypdf2
 langchain-text-splitters
 psycopg[binary]
 python-dotenv
+pandas
+openpyxl
+python-docx
+tabulate

@@ -24,6 +24,7 @@ def init_schema() -> None:
 # --- Documents -------------------------------------------------------------
 
 def insert_document(
+    chat_id: str,
     filename: str,
     content: str,
     tags: list[str],
@@ -35,24 +36,35 @@ def insert_document(
         row = conn.execute(
             """
             insert into documents
-                (filename, content, tags, chunk_count, content_type, file_data)
-            values (%s, %s, %s, %s, %s, %s)
-            returning id, filename, tags, chunk_count, created_at
+                (chat_id, filename, content, tags, chunk_count, content_type, file_data)
+            values (%s, %s, %s, %s, %s, %s, %s)
+            returning id, chat_id, filename, tags, chunk_count, created_at
             """,
-            (filename, content, tags, chunk_count, content_type, file_data),
+            (chat_id, filename, content, tags, chunk_count, content_type, file_data),
         ).fetchone()
     return row
 
 
-def list_documents() -> list[dict]:
+def list_documents(chat_id: str = None) -> list[dict]:
     with connect() as conn:
-        return conn.execute(
-            """
-            select id, filename, tags, chunk_count, created_at
-            from documents
-            order by created_at desc
-            """
-        ).fetchall()
+        if chat_id:
+            return conn.execute(
+                """
+                select id, chat_id, filename, tags, chunk_count, created_at
+                from documents
+                where chat_id = %s
+                order by created_at desc
+                """,
+                (chat_id,)
+            ).fetchall()
+        else:
+            return conn.execute(
+                """
+                select id, chat_id, filename, tags, chunk_count, created_at
+                from documents
+                order by created_at desc
+                """
+            ).fetchall()
 
 
 # --- Chats & messages ------------------------------------------------------

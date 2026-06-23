@@ -1,0 +1,17 @@
+# Python
+backend/__pycache__/
+backend/.venv/
+*.pyc
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# Qdrant (generated)
+qdrant_storage/
+
+# Postgres (generated)
+pg_data/
+
+# env
+backend/.env

@@ -145,6 +145,39 @@ def documents(chat_id: Optional[str] = None) -> list[dict]:
     return db.list_documents(chat_id)
 
 
+@app.get("/search")
+def search(query: str, chat_id: Optional[str] = None, limit: int = TOP_K) -> list[dict]:
+    query_str = query.strip()
+    if not query_str:
+        raise HTTPException(status_code=400, detail="Query string is required.")
+
+    query_filter = None
+    if chat_id:
+        query_filter = models.Filter(
+            must=[models.FieldCondition(key="chat_id", match=models.MatchValue(value=chat_id))]
+        )
+
+    hits = qdrant.query_points(
+        collection_name=COLLECTION,
+        query=embed(query_str),
+        query_filter=query_filter,
+        limit=limit,
+        with_payload=True,
+    ).points
+
+    return [
+        {
+            "id": h.id,
+            "score": h.score,
+            "text": h.payload.get("text", ""),
+            "filename": h.payload.get("filename", ""),
+            "chat_id": h.payload.get("chat_id", ""),
+        }
+        for h in hits
+    ]
+
+
+
 # --- Chat ------------------------------------------------------------------
 
 

@@ -1,4 +1,14 @@
-version: '3.8'
+# RAG App v2 infra. See docs/DATA_MODEL.md §1.
+#
+# Qdrant is managed here. Postgres + Storage are provided by **Supabase local**, run
+# separately via the Supabase CLI (full stack: Postgres + Storage + Realtime + Studio):
+#
+#     supabase init      # once, creates ./supabase
+#     supabase start     # Postgres :54322, Storage/API :54321, Studio :54323
+#
+# Point backend/.env at it (DATABASE_URL=...:54322, SUPABASE_URL=http://localhost:54321).
+# The bare Postgres + pgAdmin below are retained under the `legacy` profile for anyone
+# not yet migrated to Supabase: `docker compose --profile legacy up -d`.
 
 services:
   qdrant:
@@ -8,6 +18,7 @@ services:
 
   postgres:
     image: postgres:16-alpine
+    profiles: ["legacy"]
     environment:
       POSTGRES_USER: rag
       POSTGRES_PASSWORD: rag
@@ -17,9 +28,9 @@ services:
       - ./pg_data:/var/lib/postgresql/data
       - ./backend/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
 
-  # --- ADD THIS NEW SERVICE ---
   pgadmin:
     image: dpage/pgadmin4
+    profiles: ["legacy"]
     environment:
       PGADMIN_DEFAULT_EMAIL: abi@rag.com
       PGADMIN_DEFAULT_PASSWORD: admin

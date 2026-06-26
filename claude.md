@@ -1,39 +1,48 @@
 # RAG App
 
+> v2 is **database-first**. The design is in `docs/DATA_MODEL.md`; the Postgres schema
+> (`backend/schema.sql`) is the source of truth and is applied idempotently on startup.
+
 ## Stack
 
 * Python FastAPI backend | React + TypeScript (Vite) frontend
-* Ollama: `nomic-embed-text` (embed) · `gemma3:4b` (generate)
-* Qdrant local vector DB on `localhost:6333` (chunk vectors)
-* Postgres on `localhost:5432` (chat history, document metadata + raw files + tags) — raw `psycopg`, no ORM
+* **Postgres = system of record** (Supabase local; chats, messages, documents, pages, chunks, citations, research). Raw `psycopg`, no ORM.
+* **Qdrant** local vector DB on `localhost:6333` — collection `documents`, hybrid (dense 1024 + sparse). Point id == `chunks.id` (no mapping table).
+* **Supabase Storage** holds raw files + rendered page images (Postgres keeps `storage_path` + `sha256` only).
+* Embeddings/rerank: **BGE-M3** (dense+sparse, 1024-d) + **BGE-reranker-v2-m3**, local via `FlagEmbedding` (see `backend/embeddings.py`).
+* Generation: Ollama/vLLM (OpenAI-compatible). Router picks chat vs reasoning model per turn.
 * Package managers: `pip` (backend) · `pnpm` (frontend)
 
 ## Commands
 
 ```
-backend:  uvicorn main:app --reload          # http://localhost:8000
+backend:  uvicorn main:app --reload          # http://localhost:8001
 frontend: pnpm dev                           # http://localhost:5173
-infra:    docker compose up -d               # qdrant + postgres
+infra:    docker compose up -d               # qdrant
+supabase: supabase start                     # postgres :54322, storage/api :54321
 ```
+
+Copy `backend/.env.example` → `backend/.env` and fill in Supabase keys + model names.
 
 ## Paths
 
-* Backend entry: `backend/main.py`
-* Frontend entry: `frontend/src/App.tsx`
-* Components: `frontend/src/components/`
+* Backend entry: `backend/main.py` · data access: `backend/db.py`
+* Embeddings/chunking/rerank: `backend/embeddings.py` · Storage: `backend/storage.py`
+* Schema: `backend/schema.sql` · Design doc: `docs/DATA_MODEL.md`
+* Frontend entry: `frontend/src/App.tsx` · Components: `frontend/src/components/`
 
 ## Rules
 
-* No cloud API calls — Ollama only
-* No auth, no ORM (raw `psycopg` against Postgres)
+* No cloud API calls — all models run locally (Ollama/vLLM/FlagEmbedding)
+* No auth yet, but schema is auth-ready: every owned row has `owner_id` → seeded System user (`00000000-…-0001`)
+* No ORM (raw `psycopg`)
 * CORS: allow `localhost` and `127.0.0.1` (Vite dev server, any port)
-* Keep LangChain to `langchain-text-splitters` only
-* Qdrant collection name: `documents` · vector size: 768 · cosine distance
-* Chunk size: 500 chars · overlap: 50
-* Postgres: db/user/pass all `rag`; schema in `backend/schema.sql` (applied on startup, idempotent)
+* Qdrant collection name: `documents` · dense size 1024 · cosine · sparse named `sparse`
+* Chunking: token-based 512 / 64 overlap (BGE-M3 tokenizer)
+* Schema in `backend/schema.sql`, applied on startup, idempotent (IF NOT EXISTS)
 
 ## Do not edit
 
 * `qdrant_storage/` (generated)
-* `pg_data/` (generated — Postgres data)
+* `pg_data/` (generated — legacy Postgres data)
 * `frontend/dist/` (build output)

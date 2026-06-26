@@ -4,10 +4,15 @@ python-multipart
 qdrant-client
 ollama
 pypdf2
-langchain-text-splitters
 psycopg[binary]
 python-dotenv
 pandas
 openpyxl
 python-docx
 tabulate
+# v2: Supabase Storage (system of record for raw files)
+supabase
+# v2: BGE-M3 hybrid embeddings + reranker + tokenizer (local, runs on the DGX Spark GPU)
+FlagEmbedding
+transformers
+torch

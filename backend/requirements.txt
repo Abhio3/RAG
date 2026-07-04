@@ -2,7 +2,7 @@ fastapi
 uvicorn
 python-multipart
 qdrant-client
-ollama
+openai
 pypdf2
 psycopg[binary]
 python-dotenv
@@ -14,5 +14,10 @@ tabulate
 supabase
 # v2: BGE-M3 hybrid embeddings + reranker + tokenizer (local, runs on the DGX Spark GPU)
 FlagEmbedding
-transformers
+# ponytail: pinned <5 — FlagEmbedding 1.4.0's reranker calls tokenizer.prepare_for_model,
+# which transformers 5.x removed. Bump both together if you ever upgrade FlagEmbedding.
+transformers<5
 torch
+# v2: web research — SearXNG search (httpx) + page→markdown extraction (no browser)
+httpx
+trafilatura

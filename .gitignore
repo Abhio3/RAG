@@ -14,5 +14,9 @@ qdrant_storage/
 # Postgres (generated)
 pg_data/
 
+# Supabase CLI (generated runtime state; config.toml is tracked if present)
+supabase/.branches/
+supabase/.temp/
+
 # env
 backend/.env

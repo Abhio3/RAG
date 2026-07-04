@@ -1,0 +1,12 @@
+# Minimal SearXNG config: inherit defaults, just enable the JSON API our backend uses.
+# ponytail: only the keys we need; everything else comes from use_default_settings.
+use_default_settings: true
+
+server:
+  bind_address: "0.0.0.0"
+  secret_key: "local-dev-change-me"   # local-only; rotate if ever exposed
+
+search:
+  formats:
+    - html
+    - json

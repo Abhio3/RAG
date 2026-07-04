@@ -5,14 +5,16 @@ raw files live in Supabase Storage. Retrieval is BGE-M3 hybrid (dense + sparse, 
 in Qdrant) followed by a BGE reranker before the context reaches the LLM.
 """
 import hashlib
+import json
 import os
 import re
 from contextlib import asynccontextmanager
+from functools import lru_cache
 from io import BytesIO
 from typing import Optional
 
-import ollama
 import pandas as pd
+from openai import OpenAI
 from docx import Document
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -27,17 +29,51 @@ load_dotenv()  # read backend/.env (Supabase keys, model overrides) before our m
 import db          # noqa: E402  (after load_dotenv so env vars are available)
 import embeddings  # noqa: E402
 import storage     # noqa: E402
+import web         # noqa: E402
 
 # --- Config ----------------------------------------------------------------
 COLLECTION = "documents"
 VECTOR_SIZE = embeddings.EMBED_DIM            # 1024 (BGE-M3 dense)
 EMBED_MODEL = embeddings.EMBED_MODEL          # 'BAAI/bge-m3'
 RERANK_MODEL = embeddings.RERANK_MODEL        # 'BAAI/bge-reranker-v2-m3'
-CHAT_MODEL = os.environ.get("CHAT_MODEL", "qwen3.5:35b")
-REASONING_MODEL = os.environ.get("REASONING_MODEL", "deepseek-r1:70b")
+CHAT_MODEL = os.environ.get("CHAT_MODEL", "Qwen/Qwen3-14B")
+# No separate reasoning model by default — Qwen3 has native thinking mode (see _THINK_RE
+# below). Set REASONING_MODEL in .env only if you actually run a second vLLM server.
+REASONING_MODEL = os.environ.get("REASONING_MODEL", CHAT_MODEL)
 USE_RERANKER = os.environ.get("USE_RERANKER", "true").lower() == "true"
 PREFETCH_LIMIT = int(os.environ.get("PREFETCH_LIMIT", "30"))  # fused candidates from Qdrant
 TOP_K = int(os.environ.get("TOP_K", "6"))                     # passages sent to the LLM
+
+# --- LLM serving (vLLM, OpenAI-compatible) ---------------------------------
+# vLLM serves one model per process, so chat and reasoning models may live behind
+# different base URLs (two vLLM servers). Both default to a single VLLM_BASE_URL;
+# override per role only if you run them separately. The model name must match the
+# server's --served-model-name. See docs/DATA_MODEL.md §1, §7.
+VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://localhost:8000/v1")
+VLLM_API_KEY = os.environ.get("VLLM_API_KEY", "EMPTY")  # vLLM ignores it unless --api-key is set
+CHAT_BASE_URL = os.environ.get("CHAT_BASE_URL", VLLM_BASE_URL)
+REASONING_BASE_URL = os.environ.get("REASONING_BASE_URL", VLLM_BASE_URL)
+_MODEL_BASE_URL = {CHAT_MODEL: CHAT_BASE_URL, REASONING_MODEL: REASONING_BASE_URL}
+
+
+@lru_cache(maxsize=4)
+def _llm_client(base_url: str) -> OpenAI:
+    """OpenAI-compatible client for a vLLM endpoint (cached per base URL)."""
+    return OpenAI(base_url=base_url, api_key=VLLM_API_KEY)
+
+
+def _complete(prompt: str, model_id: str, base_url: str) -> str:
+    """One-shot (non-streamed) completion — used for research planning."""
+    resp = _llm_client(base_url).chat.completions.create(
+        model=model_id, messages=[{"role": "user", "content": prompt}]
+    )
+    return resp.choices[0].message.content or ""
+
+
+def _event(**kw) -> str:
+    """One NDJSON line for the research progress stream."""
+    return json.dumps(kw) + "\n"
+
 
 qdrant = QdrantClient(url=os.environ.get("QDRANT_URL", "http://localhost:6333"))
 
@@ -79,8 +115,8 @@ def seed_models() -> None:
     """Register the active models so message/chunk FKs resolve (§4, §7)."""
     db.upsert_model(EMBED_MODEL, "embedding", provider="flagembedding", dimensions=VECTOR_SIZE)
     db.upsert_model(RERANK_MODEL, "reranker", provider="flagembedding")
-    db.upsert_model(CHAT_MODEL, "chat", provider="ollama")
-    db.upsert_model(REASONING_MODEL, "reasoning", provider="ollama")
+    db.upsert_model(CHAT_MODEL, "chat", provider="vllm")
+    db.upsert_model(REASONING_MODEL, "reasoning", provider="vllm")
 
 
 @asynccontextmanager
@@ -135,6 +171,66 @@ def extract_pages(filename: str, data: bytes) -> list[dict]:
             detail="Only PDF, TXT, MD, CSV, XLSX, and DOCX files are supported.",
         )
     return pages
+
+
+# --- Indexing --------------------------------------------------------------
+
+def index_pages(doc_id: str, chat_id: Optional[str], title: str, pages: list[dict],
+                *, source_type: str = "upload", tag_list: Optional[list[str]] = None) -> int:
+    """Chunk → embed (dense+sparse) → Qdrant upsert for a doc's pages; flip it ready.
+
+    Shared by /upload and the research crawler (which ingests web pages as documents).
+    Returns the number of chunks indexed (0 if the pages had no extractable text).
+    """
+    tag_list = tag_list or []
+    db.set_document_status(doc_id, "chunking")
+    db.insert_pages(doc_id, pages)
+
+    chunk_specs: list[dict] = []
+    for page in pages:
+        for piece in embeddings.chunk_text(page.get("text") or ""):
+            chunk_specs.append({
+                "chunk_index": len(chunk_specs),
+                "page_no": page["page_no"],
+                "content": piece,
+                "content_tokens": embeddings.count_tokens(piece),
+                "source_kind": "text",
+            })
+    if not chunk_specs:
+        return 0
+
+    chunk_rows = db.insert_chunks(doc_id, chunk_specs, chat_id=chat_id, embedding_model=EMBED_MODEL)
+    db.set_document_status(doc_id, "embedding")
+    vectors = embeddings.embed_texts([c["content"] for c in chunk_rows])
+    points = [
+        models.PointStruct(
+            id=str(row["id"]),
+            vector={
+                "dense": vec["dense"],
+                "sparse": models.SparseVector(
+                    indices=vec["sparse"]["indices"], values=vec["sparse"]["values"]
+                ),
+            },
+            payload={
+                "text": row["content"],
+                "owner_id": db.SYSTEM_USER_ID,
+                "chat_id": chat_id,
+                "document_id": doc_id,
+                "title": title,
+                "page_no": row["page_no"],
+                "source_type": source_type,
+                "source_kind": "text",
+                "tags": tag_list,
+            },
+        )
+        for row, vec in zip(chunk_rows, vectors)
+    ]
+    # ponytail: upload_points batches internally (default 64/req) so large docs don't
+    # blow past Qdrant's request-size limit the way one big upsert() call would.
+    qdrant.upload_points(collection_name=COLLECTION, points=points, wait=True)
+    db.attach_tags(doc_id, tag_list)
+    db.mark_ready(doc_id)
+    return len(chunk_rows)
 
 
 # --- Retrieval -------------------------------------------------------------
@@ -239,65 +335,14 @@ async def upload(
     tag_list = [t.strip() for t in tags.split(",") if t.strip()]
 
     try:
-        # 1. raw file → Supabase Storage; record the path.
+        # raw file → Supabase Storage; record the path, then index its pages.
         storage_path = f"{db.SYSTEM_USER_ID}/{doc_id}/{file.filename}"
         storage.upload(storage_path, data, mime)
         db.update_document(doc_id, storage_path=storage_path, page_count=len(pages))
-
-        # 2. persist per-page parsed text.
-        db.set_document_status(doc_id, "chunking")
-        db.insert_pages(doc_id, pages)
-
-        # 3. token-chunk each page → chunk rows (their ids become Qdrant point ids).
-        chunk_specs: list[dict] = []
-        for page in pages:
-            for idx, piece in enumerate(embeddings.chunk_text(page["text"])):
-                chunk_specs.append(
-                    {
-                        "chunk_index": len(chunk_specs),
-                        "page_no": page["page_no"],
-                        "content": piece,
-                        "content_tokens": embeddings.count_tokens(piece),
-                        "source_kind": "text",
-                    }
-                )
-        if not chunk_specs:
+        n_chunks = index_pages(doc_id, chat_id, file.filename, pages,
+                               source_type="upload", tag_list=tag_list)
+        if not n_chunks:
             raise HTTPException(status_code=400, detail="No extractable text found.")
-        chunk_rows = db.insert_chunks(
-            doc_id, chunk_specs, chat_id=chat_id, embedding_model=EMBED_MODEL
-        )
-
-        # 4. embed (dense+sparse) and upsert to Qdrant under each chunk's id.
-        db.set_document_status(doc_id, "embedding")
-        vectors = embeddings.embed_texts([c["content"] for c in chunk_rows])
-        points = [
-            models.PointStruct(
-                id=str(row["id"]),
-                vector={
-                    "dense": vec["dense"],
-                    "sparse": models.SparseVector(
-                        indices=vec["sparse"]["indices"], values=vec["sparse"]["values"]
-                    ),
-                },
-                payload={
-                    "text": row["content"],
-                    "owner_id": db.SYSTEM_USER_ID,
-                    "chat_id": chat_id,
-                    "document_id": doc_id,
-                    "title": file.filename,
-                    "page_no": row["page_no"],
-                    "source_type": "upload",
-                    "source_kind": "text",
-                    "tags": tag_list,
-                },
-            )
-            for row, vec in zip(chunk_rows, vectors)
-        ]
-        qdrant.upsert(collection_name=COLLECTION, points=points)
-
-        # 5. tags + ready.
-        db.attach_tags(doc_id, tag_list)
-        db.mark_ready(doc_id)
     except HTTPException:
         db.set_document_status(doc_id, "failed", "no extractable text")
         raise
@@ -309,7 +354,7 @@ async def upload(
         "id": doc_id,
         "chat_id": chat_id,
         "filename": file.filename,
-        "chunks": len(chunk_rows),
+        "chunks": n_chunks,
         "tags": tag_list,
         "status": "ready",
     }
@@ -333,6 +378,7 @@ def search(query: str, chat_id: Optional[str] = None, limit: int = TOP_K) -> lis
 class ChatRequest(BaseModel):
     question: str
     chat_id: str | None = None
+    mode: str = "chat"  # 'chat' | 'research' | 'deep_research'
 
 
 @app.get("/chats")
@@ -359,6 +405,114 @@ def route_model(question: str) -> str:
     return REASONING_MODEL if _REASONING_RE.search(question) else CHAT_MODEL
 
 
+def research_stream(question: str, chat_id: str, mode: str):
+    """Search → crawl → ingest → synthesize, streaming NDJSON progress then the answer.
+
+    The reasoning model decomposes the task into sub-queries; each is searched on the
+    local SearXNG, the top hits are fetched to markdown (trafilatura) and ingested as
+    web documents through the normal pipeline, then the answer is synthesized over the
+    freshly-indexed chunks. deep_research just widens the fan-out (§6, §7).
+    """
+    model_id, base_url = REASONING_MODEL, REASONING_BASE_URL
+    run_id = str(db.create_research_run(chat_id, question, mode, model_id=model_id)["id"])
+    n_subq = 4 if mode == "deep_research" else 2
+    per_q = 4 if mode == "deep_research" else 3
+    step = 0
+
+    yield _event(type="status", text="Planning sub-questions…")
+    plan = _complete(
+        f"Break this research task into {n_subq} focused web-search queries. "
+        f"Output one query per line, no numbering, no extra text.\n\nTask: {question}",
+        model_id, base_url,
+    )
+    # ponytail: line-split parse; the prompt pins the format. Tighten only if a model ignores it.
+    subqs = [ln.strip(" -*\t") for ln in plan.splitlines() if ln.strip()][:n_subq] or [question]
+    db.add_research_step(run_id, step, "reason", input=question, output="\n".join(subqs)); step += 1
+    yield _event(type="plan", questions=subqs)
+
+    for sq in subqs:
+        yield _event(type="step", kind="search", text=f"Searching: {sq}")
+        try:
+            results = web.search(sq, k=per_q)
+        except Exception as exc:  # noqa: BLE001
+            yield _event(type="step", kind="search", text=f"Search failed: {exc}")
+            continue
+        db.add_research_step(run_id, step, "search", input=sq,
+                             output="\n".join(r["url"] for r in results)); step += 1
+        for res in results:
+            url = res["url"]
+            yield _event(type="step", kind="crawl", text=f"Reading {url}")
+            try:
+                md = web.fetch_markdown(url)
+            except Exception as exc:  # noqa: BLE001
+                yield _event(type="step", kind="crawl", text=f"Fetch failed: {exc}")
+                continue
+            if not md.strip():
+                continue
+            sha = hashlib.sha256(md.encode()).hexdigest()
+            existing = db.find_document_by_hash(sha)
+            if existing:
+                doc_id = str(existing["id"])
+            else:
+                doc = db.insert_document(
+                    title=res["title"], chat_id=chat_id, source_type="web", source_url=url,
+                    mime_type="text/markdown", file_size=len(md.encode()), sha256=sha, status="parsing",
+                )
+                doc_id = str(doc["id"])
+                try:
+                    index_pages(doc_id, chat_id, res["title"],
+                                [{"page_no": 1, "text": md}], source_type="web")
+                except Exception as exc:  # noqa: BLE001
+                    db.set_document_status(doc_id, "failed", str(exc)[:500])
+                    continue
+            db.insert_web_source(run_id, url, document_id=doc_id, title=res["title"], content_hash=sha)
+            db.add_research_step(run_id, step, "crawl", input=url, output=res["title"]); step += 1
+
+    yield _event(type="status", text="Synthesizing answer…")
+    hits = hybrid_search(question, chat_id, top_k=8)
+    context = "\n\n".join(h["text"] for h in hits)
+    prompt = (
+        "Answer the research question using only the sources below. Cite concrete facts. "
+        "If the sources are insufficient, say so.\n\n"
+        f"Sources:\n{context}\n\nQuestion: {question}"
+    )
+
+    answer, reasoning_parts, usage = "", [], {}
+    stream = _llm_client(base_url).chat.completions.create(
+        model=model_id, messages=[{"role": "user", "content": prompt}],
+        stream=True, stream_options={"include_usage": True},
+    )
+    for chunk in stream:
+        if chunk.usage:
+            usage = {"prompt": chunk.usage.prompt_tokens, "completion": chunk.usage.completion_tokens,
+                     "total": chunk.usage.total_tokens}
+        if not chunk.choices:
+            continue
+        delta = chunk.choices[0].delta
+        if (rc := getattr(delta, "reasoning_content", None)):
+            reasoning_parts.append(rc)
+        if (token := delta.content or ""):
+            answer += token
+            yield _event(type="token", text=token)
+
+    if reasoning_parts:
+        reasoning, content = "".join(reasoning_parts).strip() or None, answer.strip()
+    elif (think := _THINK_RE.findall(answer)):
+        reasoning, content = "\n".join(t.strip() for t in think), _THINK_RE.sub("", answer).strip()
+    else:
+        reasoning, content = None, answer.strip()
+
+    msg = db.add_message(chat_id, "assistant", content or answer,
+                         reasoning_content=reasoning, model_id=model_id, token_usage=usage or None)
+    db.add_citations(str(msg["id"]), [
+        {"chunk_id": h["chunk_id"], "document_id": h["document_id"],
+         "quote": h["text"][:500], "rank": i + 1, "score": h["score"]}
+        for i, h in enumerate(hits)
+    ])
+    db.finish_research_run(run_id, "done", message_id=str(msg["id"]), token_usage=usage or None)
+    yield _event(type="done")
+
+
 @app.post("/chat")
 def chat(req: ChatRequest) -> StreamingResponse:
     question = req.question.strip()
@@ -367,13 +521,21 @@ def chat(req: ChatRequest) -> StreamingResponse:
 
     chat_id = req.chat_id
     if not chat_id:
-        chat_id = str(db.create_chat(title=question[:60])["id"])
+        chat_id = str(db.create_chat(title=question[:60], mode=req.mode)["id"])
     db.add_message(chat_id, "user", question)
     db.touch_chat(chat_id)
+
+    headers = {"X-Chat-Id": chat_id, "Access-Control-Expose-Headers": "X-Chat-Id"}
+    if req.mode in ("research", "deep_research"):
+        return StreamingResponse(
+            research_stream(question, chat_id, req.mode),
+            media_type="application/x-ndjson", headers=headers,
+        )
 
     hits = hybrid_search(question, chat_id)
     context = "\n\n".join(h["text"] for h in hits)
     model_id = route_model(question)
+    base_url = _MODEL_BASE_URL.get(model_id, VLLM_BASE_URL)
     prompt = (
         "Answer the question using only the context below. If the context is "
         "insufficient, say so.\n\n"
@@ -382,22 +544,44 @@ def chat(req: ChatRequest) -> StreamingResponse:
 
     def generate():
         answer = ""
+        reasoning_parts: list[str] = []
         usage = {}
-        for part in ollama.generate(model=model_id, prompt=prompt, stream=True):
-            token = part.get("response", "")
-            answer += token
-            yield token
-            if part.get("done"):
+        stream = _llm_client(base_url).chat.completions.create(
+            model=model_id,
+            messages=[{"role": "user", "content": prompt}],
+            stream=True,
+            stream_options={"include_usage": True},
+        )
+        for chunk in stream:
+            # vLLM emits a final usage-only chunk when stream_options.include_usage is set.
+            if chunk.usage:
                 usage = {
-                    "prompt": part.get("prompt_eval_count"),
-                    "completion": part.get("eval_count"),
-                    "total": (part.get("prompt_eval_count") or 0) + (part.get("eval_count") or 0),
+                    "prompt": chunk.usage.prompt_tokens,
+                    "completion": chunk.usage.completion_tokens,
+                    "total": chunk.usage.total_tokens,
                 }
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            # When vLLM runs a --reasoning-parser, the <think> trace arrives separately.
+            rc = getattr(delta, "reasoning_content", None)
+            if rc:
+                reasoning_parts.append(rc)
+            token = delta.content or ""
+            if token:
+                answer += token
+                yield token
 
-        # Split out the <think> reasoning trace so it can be shown collapsibly.
-        think = _THINK_RE.findall(answer)
-        reasoning = "\n".join(t.strip() for t in think) if think else None
-        content = _THINK_RE.sub("", answer).strip()
+        # Reasoning trace: prefer the parser's separate channel, else split out <think>.
+        if reasoning_parts:
+            reasoning = "".join(reasoning_parts).strip() or None
+            content = answer.strip()
+        elif (think := _THINK_RE.findall(answer)):
+            reasoning = "\n".join(t.strip() for t in think)
+            content = _THINK_RE.sub("", answer).strip()
+        else:
+            reasoning = None
+            content = answer.strip()
 
         msg = db.add_message(
             chat_id, "assistant", content or answer,
@@ -417,8 +601,4 @@ def chat(req: ChatRequest) -> StreamingResponse:
             ],
         )
 
-    return StreamingResponse(
-        generate(),
-        media_type="text/plain",
-        headers={"X-Chat-Id": chat_id, "Access-Control-Expose-Headers": "X-Chat-Id"},
-    )
+    return StreamingResponse(generate(), media_type="text/plain", headers=headers)

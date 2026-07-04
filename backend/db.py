@@ -34,7 +34,7 @@ def init_schema() -> None:
 def upsert_model(
     model_id: str,
     kind: str,
-    provider: str = "ollama",
+    provider: str = "vllm",
     context_len: Optional[int] = None,
     dimensions: Optional[int] = None,
     active: bool = True,
@@ -354,3 +354,57 @@ def attach_tags(document_id: str, tags: list[str]) -> None:
                 """,
                 (document_id, tag["id"]),
             )
+
+
+# --- Research / deep-research ----------------------------------------------
+
+def create_research_run(chat_id: str, query: str, mode: str,
+                        model_id: Optional[str] = None) -> dict:
+    with connect() as conn:
+        return conn.execute(
+            """
+            insert into research_runs (chat_id, query, mode, model_id)
+            values (%s, %s, %s, %s)
+            returning id, status, started_at
+            """,
+            (chat_id, query, mode, model_id),
+        ).fetchone()
+
+
+def add_research_step(run_id: str, step_no: int, type: str,
+                     input: Optional[str] = None, output: Optional[str] = None) -> None:
+    with connect() as conn:
+        conn.execute(
+            """
+            insert into research_steps (run_id, step_no, type, input, output)
+            values (%s, %s, %s, %s, %s)
+            """,
+            (run_id, step_no, type, input, output),
+        )
+
+
+def finish_research_run(run_id: str, status: str, message_id: Optional[str] = None,
+                       token_usage: Optional[dict] = None) -> None:
+    with connect() as conn:
+        conn.execute(
+            """
+            update research_runs
+            set status = %s, message_id = %s, token_usage = %s, finished_at = now()
+            where id = %s
+            """,
+            (status, message_id, Jsonb(token_usage) if token_usage else None, run_id),
+        )
+
+
+def insert_web_source(run_id: str, url: str, *, document_id: Optional[str] = None,
+                     title: Optional[str] = None, fetcher: str = "http",
+                     content_hash: Optional[str] = None) -> dict:
+    with connect() as conn:
+        return conn.execute(
+            """
+            insert into web_sources (run_id, document_id, url, title, fetcher, content_hash)
+            values (%s, %s, %s, %s, %s, %s)
+            returning id
+            """,
+            (run_id, document_id, url, title, fetcher, content_hash),
+        ).fetchone()

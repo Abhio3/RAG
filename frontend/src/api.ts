@@ -5,6 +5,7 @@ export type DbMessage = {
   id: string;
   role: "user" | "assistant";
   content: string;
+  reasoning_content: string | null;
   created_at: string;
 };
 
@@ -45,63 +46,48 @@ export async function getMessages(chatId: string): Promise<DbMessage[]> {
   return res.json();
 }
 
-export type ResearchEvent =
+/** Every mode now streams the same NDJSON events. `status`/`plan`/`step` only appear in
+ *  research modes; `reasoning` carries the <think> trace split out by the backend. */
+export type ChatEvent =
   | { type: "status"; text: string }
   | { type: "plan"; questions: string[] }
   | { type: "step"; kind: string; text: string }
   | { type: "token"; text: string }
+  | { type: "reasoning"; text: string }
+  | { type: "error"; text: string }
   | { type: "done" };
 
-/** Research / deep-research: streams NDJSON progress events then answer tokens. */
-export async function streamResearch(
+/** Stream a turn (chat / research / deep_research); returns the chat id it belongs to.
+ *  Pre-response failures reject; mid-stream failures arrive as an `error` event (so a
+ *  socket drop surfaces on the in-flight message instead of ending silently). */
+export async function streamChat(
   question: string,
   chatId: string | null,
-  mode: "research" | "deep_research",
-  onEvent: (e: ResearchEvent) => void
+  mode: "chat" | "research" | "deep_research",
+  onEvent: (e: ChatEvent) => void
 ): Promise<string> {
   const res = await fetch(`${API_BASE}/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ question, chat_id: chatId, mode }),
   });
-  if (!res.ok || !res.body) throw new Error(`Research failed (${res.status})`);
+  if (!res.ok || !res.body) throw new Error(`Chat failed (${res.status})`);
   const newChatId = res.headers.get("X-Chat-Id") || chatId || "";
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buf = "";
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
-    const lines = buf.split("\n");
-    buf = lines.pop() || ""; // keep the trailing partial line for the next read
-    for (const line of lines) if (line.trim()) onEvent(JSON.parse(line));
-  }
-  if (buf.trim()) onEvent(JSON.parse(buf));
-  return newChatId;
-}
-
-/** Streams the answer; returns the chat id this turn belongs to. */
-export async function streamChat(
-  question: string,
-  chatId: string | null,
-  onChunk: (text: string) => void
-): Promise<string> {
-  const res = await fetch(`${API_BASE}/chat`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ question, chat_id: chatId }),
-  });
-  if (!res.ok || !res.body) {
-    throw new Error(`Chat failed (${res.status})`);
-  }
-  const newChatId = res.headers.get("X-Chat-Id") || chatId || "";
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    onChunk(decoder.decode(value, { stream: true }));
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split("\n");
+      buf = lines.pop() || ""; // keep the trailing partial line for the next read
+      for (const line of lines) if (line.trim()) onEvent(JSON.parse(line));
+    }
+    if (buf.trim()) onEvent(JSON.parse(buf));
+  } catch (err) {
+    onEvent({ type: "error", text: (err as Error).message || "Connection lost" });
   }
   return newChatId;
 }

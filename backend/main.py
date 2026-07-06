@@ -14,7 +14,8 @@ from io import BytesIO
 from typing import Optional
 
 import pandas as pd
-from openai import OpenAI
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_openai import ChatOpenAI
 from docx import Document
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -30,6 +31,7 @@ import db          # noqa: E402  (after load_dotenv so env vars are available)
 import embeddings  # noqa: E402
 import storage     # noqa: E402
 import web         # noqa: E402
+from think_stream import ThinkStream  # noqa: E402
 
 # --- Config ----------------------------------------------------------------
 COLLECTION = "documents"
@@ -37,8 +39,9 @@ VECTOR_SIZE = embeddings.EMBED_DIM            # 1024 (BGE-M3 dense)
 EMBED_MODEL = embeddings.EMBED_MODEL          # 'BAAI/bge-m3'
 RERANK_MODEL = embeddings.RERANK_MODEL        # 'BAAI/bge-reranker-v2-m3'
 CHAT_MODEL = os.environ.get("CHAT_MODEL", "Qwen/Qwen3-14B")
-# No separate reasoning model by default — Qwen3 has native thinking mode (see _THINK_RE
-# below). Set REASONING_MODEL in .env only if you actually run a second vLLM server.
+# No separate reasoning model by default — Qwen3 has native thinking mode (the <think>
+# trace is split out live by think_stream.ThinkStream). Set REASONING_MODEL in .env only
+# if you actually run a second vLLM server.
 REASONING_MODEL = os.environ.get("REASONING_MODEL", CHAT_MODEL)
 USE_RERANKER = os.environ.get("USE_RERANKER", "true").lower() == "true"
 PREFETCH_LIMIT = int(os.environ.get("PREFETCH_LIMIT", "30"))  # fused candidates from Qdrant
@@ -56,23 +59,53 @@ REASONING_BASE_URL = os.environ.get("REASONING_BASE_URL", VLLM_BASE_URL)
 _MODEL_BASE_URL = {CHAT_MODEL: CHAT_BASE_URL, REASONING_MODEL: REASONING_BASE_URL}
 
 
-@lru_cache(maxsize=4)
-def _llm_client(base_url: str) -> OpenAI:
-    """OpenAI-compatible client for a vLLM endpoint (cached per base URL)."""
-    return OpenAI(base_url=base_url, api_key=VLLM_API_KEY)
+@lru_cache(maxsize=8)
+def _llm(base_url: str, model_id: str) -> ChatOpenAI:
+    """LangChain chat model for a vLLM endpoint (cached per base_url+model)."""
+    return ChatOpenAI(
+        base_url=base_url, api_key=VLLM_API_KEY, model=model_id,
+        streaming=True, stream_usage=True,
+    )
 
 
 def _complete(prompt: str, model_id: str, base_url: str) -> str:
     """One-shot (non-streamed) completion — used for research planning."""
-    resp = _llm_client(base_url).chat.completions.create(
-        model=model_id, messages=[{"role": "user", "content": prompt}]
-    )
-    return resp.choices[0].message.content or ""
+    return _llm(base_url, model_id).invoke(prompt).content or ""
 
 
 def _event(**kw) -> str:
-    """One NDJSON line for the research progress stream."""
+    """One NDJSON line for the token/reasoning/progress stream."""
     return json.dumps(kw) + "\n"
+
+
+# Chat + research prompts as LCEL templates; each composes into `prompt | _llm(...)`.
+_CHAT_PROMPT = ChatPromptTemplate.from_template(
+    "Answer the question using only the context below. If the context is "
+    "insufficient, say so.\n\nContext:\n{context}\n\nQuestion: {question}"
+)
+_RESEARCH_PROMPT = ChatPromptTemplate.from_template(
+    "Answer the research question using only the sources below. Cite concrete facts. "
+    "If the sources are insufficient, say so.\n\nSources:\n{context}\n\nQuestion: {question}"
+)
+
+
+def _stream_answer(chain, inputs: dict):
+    """Yield ('answer'|'reasoning'|'usage', value) from an LCEL chain's token stream.
+
+    Prefers the model's separate reasoning channel (additional_kwargs) if a parser is ever
+    enabled; otherwise the <think> splitter routes inline thinking to the reasoning channel.
+    """
+    splitter = ThinkStream()
+    for chunk in chain.stream(inputs):
+        if (rc := (chunk.additional_kwargs or {}).get("reasoning_content")):
+            yield ("reasoning", rc)
+        if (um := getattr(chunk, "usage_metadata", None)):
+            yield ("usage", {"prompt": um.get("input_tokens"),
+                             "completion": um.get("output_tokens"),
+                             "total": um.get("total_tokens")})
+        if (text := chunk.content or ""):
+            yield from splitter.feed(text)
+    yield from splitter.flush()
 
 
 qdrant = QdrantClient(url=os.environ.get("QDRANT_URL", "http://localhost:6333"))
@@ -397,7 +430,6 @@ _REASONING_RE = re.compile(
     r"how many|equation|integral|algorithm|complexity|optimi[sz]e)\b",
     re.IGNORECASE,
 )
-_THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
 
 
 def route_model(question: str) -> str:
@@ -471,39 +503,27 @@ def research_stream(question: str, chat_id: str, mode: str):
     yield _event(type="status", text="Synthesizing answer…")
     hits = hybrid_search(question, chat_id, top_k=8)
     context = "\n\n".join(h["text"] for h in hits)
-    prompt = (
-        "Answer the research question using only the sources below. Cite concrete facts. "
-        "If the sources are insufficient, say so.\n\n"
-        f"Sources:\n{context}\n\nQuestion: {question}"
-    )
 
-    answer, reasoning_parts, usage = "", [], {}
-    stream = _llm_client(base_url).chat.completions.create(
-        model=model_id, messages=[{"role": "user", "content": prompt}],
-        stream=True, stream_options={"include_usage": True},
-    )
-    for chunk in stream:
-        if chunk.usage:
-            usage = {"prompt": chunk.usage.prompt_tokens, "completion": chunk.usage.completion_tokens,
-                     "total": chunk.usage.total_tokens}
-        if not chunk.choices:
-            continue
-        delta = chunk.choices[0].delta
-        if (rc := getattr(delta, "reasoning_content", None)):
-            reasoning_parts.append(rc)
-        if (token := delta.content or ""):
-            answer += token
-            yield _event(type="token", text=token)
+    answer, reasoning, usage = "", "", {}
+    try:
+        chain = _RESEARCH_PROMPT | _llm(base_url, model_id)
+        for kind, val in _stream_answer(chain, {"context": context, "question": question}):
+            if kind == "usage":
+                usage = val
+            elif kind == "reasoning":
+                reasoning += val
+                yield _event(type="reasoning", text=val)
+            else:
+                answer += val
+                yield _event(type="token", text=val)
+    except Exception as exc:  # noqa: BLE001 — surface mid-stream failures to the client
+        yield _event(type="error", text=f"Synthesis failed: {exc}")
+        db.finish_research_run(run_id, "failed")
+        return
 
-    if reasoning_parts:
-        reasoning, content = "".join(reasoning_parts).strip() or None, answer.strip()
-    elif (think := _THINK_RE.findall(answer)):
-        reasoning, content = "\n".join(t.strip() for t in think), _THINK_RE.sub("", answer).strip()
-    else:
-        reasoning, content = None, answer.strip()
-
-    msg = db.add_message(chat_id, "assistant", content or answer,
-                         reasoning_content=reasoning, model_id=model_id, token_usage=usage or None)
+    msg = db.add_message(chat_id, "assistant", answer.strip() or "(no answer)",
+                         reasoning_content=reasoning.strip() or None,
+                         model_id=model_id, token_usage=usage or None)
     db.add_citations(str(msg["id"]), [
         {"chunk_id": h["chunk_id"], "document_id": h["document_id"],
          "quote": h["text"][:500], "rank": i + 1, "score": h["score"]}
@@ -536,56 +556,29 @@ def chat(req: ChatRequest) -> StreamingResponse:
     context = "\n\n".join(h["text"] for h in hits)
     model_id = route_model(question)
     base_url = _MODEL_BASE_URL.get(model_id, VLLM_BASE_URL)
-    prompt = (
-        "Answer the question using only the context below. If the context is "
-        "insufficient, say so.\n\n"
-        f"Context:\n{context}\n\nQuestion: {question}"
-    )
 
     def generate():
-        answer = ""
-        reasoning_parts: list[str] = []
-        usage = {}
-        stream = _llm_client(base_url).chat.completions.create(
-            model=model_id,
-            messages=[{"role": "user", "content": prompt}],
-            stream=True,
-            stream_options={"include_usage": True},
-        )
-        for chunk in stream:
-            # vLLM emits a final usage-only chunk when stream_options.include_usage is set.
-            if chunk.usage:
-                usage = {
-                    "prompt": chunk.usage.prompt_tokens,
-                    "completion": chunk.usage.completion_tokens,
-                    "total": chunk.usage.total_tokens,
-                }
-            if not chunk.choices:
-                continue
-            delta = chunk.choices[0].delta
-            # When vLLM runs a --reasoning-parser, the <think> trace arrives separately.
-            rc = getattr(delta, "reasoning_content", None)
-            if rc:
-                reasoning_parts.append(rc)
-            token = delta.content or ""
-            if token:
-                answer += token
-                yield token
-
-        # Reasoning trace: prefer the parser's separate channel, else split out <think>.
-        if reasoning_parts:
-            reasoning = "".join(reasoning_parts).strip() or None
-            content = answer.strip()
-        elif (think := _THINK_RE.findall(answer)):
-            reasoning = "\n".join(t.strip() for t in think)
-            content = _THINK_RE.sub("", answer).strip()
-        else:
-            reasoning = None
-            content = answer.strip()
+        answer, reasoning, usage = "", "", {}
+        try:
+            chain = _CHAT_PROMPT | _llm(base_url, model_id)
+            for kind, val in _stream_answer(chain, {"context": context, "question": question}):
+                if kind == "usage":
+                    usage = val
+                elif kind == "reasoning":
+                    reasoning += val
+                    yield _event(type="reasoning", text=val)
+                else:
+                    answer += val
+                    yield _event(type="token", text=val)
+        except Exception as exc:  # noqa: BLE001 — surface mid-stream failures to the client
+            yield _event(type="error", text=f"Generation failed: {exc}")
+            db.add_message(chat_id, "assistant", answer.strip() or f"[error] {exc}",
+                           reasoning_content=reasoning.strip() or None, model_id=model_id)
+            return
 
         msg = db.add_message(
-            chat_id, "assistant", content or answer,
-            reasoning_content=reasoning, model_id=model_id, token_usage=usage or None,
+            chat_id, "assistant", answer.strip() or "(no answer)",
+            reasoning_content=reasoning.strip() or None, model_id=model_id, token_usage=usage or None,
         )
         db.add_citations(
             str(msg["id"]),
@@ -600,5 +593,6 @@ def chat(req: ChatRequest) -> StreamingResponse:
                 for i, h in enumerate(hits)
             ],
         )
+        yield _event(type="done")
 
-    return StreamingResponse(generate(), media_type="text/plain", headers=headers)
+    return StreamingResponse(generate(), media_type="application/x-ndjson", headers=headers)

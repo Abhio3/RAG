@@ -35,11 +35,13 @@ supabase start              # Postgres :54322, Storage/API :54321, Studio :54323
 ```bash
 # One server handles chat + research/reasoning — Qwen3 has native thinking mode
 # (backend/main.py splits out the <think> trace itself, no --reasoning-parser needed).
-# --gpu-memory-utilization is a FRACTION OF TOTAL GPU MEMORY, not of what's free — check
-# `nvidia-smi` / `ss -tlnp` for what else is already running before picking a port/value.
-# On this box, chandra-ocr owns :8000/:8001 and reserves a chunk of the GPU, so we use an
-# AWQ build (~9GB) on :3004 with a conservative utilization instead of vLLM's ~0.9 default.
-vllm serve Qwen/Qwen3-14B-AWQ --port 3004 --gpu-memory-utilization 0.4 --max-model-len 8192
+# THIS IS A GRACE-BLACKWELL / UNIFIED-MEMORY BOX: "GPU memory" == the 128GB system RAM
+# (nvidia-smi reports N/A). So --gpu-memory-utilization is a fraction of ALL 128GB, and
+# vLLM RESERVES it up front — 0.4 pre-commits ~48GB for one server, mostly KV cache a
+# single-user RAG never uses. That reservation, stacked with chandra-ocr's, is what
+# peaks RAM / OOMs the box. AWQ weights are ~9GB; a few GB of KV is plenty here, so keep
+# the fraction low and cap concurrency. Raise only if you actually serve many parallel users.
+vllm serve Qwen/Qwen3-14B-AWQ --port 3004 --gpu-memory-utilization 0.15 --max-model-len 8192 --max-num-seqs 4
 ```
 
 Only run a second server (different port, override `REASONING_BASE_URL`) if you want a
@@ -47,13 +49,13 @@ dedicated reasoning model distinct from `CHAT_MODEL`.
 
 **Ports used by this app** (pick different ones if something else already holds these):
 
-| Port | Service |
-| ---- | ------- |
-| 3000 | Backend (FastAPI) |
-| 3001 | Frontend (Vite) |
-| 3004 | vLLM (Qwen3-14B-AWQ) |
-| 6333 | Qdrant |
-| 8888 | SearXNG |
+| Port        | Service                                  |
+| ----------- | ---------------------------------------- |
+| 3000        | Backend (FastAPI)                        |
+| 3001        | Frontend (Vite)                          |
+| 3004        | vLLM (Qwen3-14B-AWQ)                     |
+| 6333        | Qdrant                                   |
+| 8888        | SearXNG                                  |
 | 54321-54323 | Supabase (Storage/API, Postgres, Studio) |
 
 Embeddings and the reranker load locally on first use — no server needed.
@@ -80,15 +82,15 @@ Open http://localhost:3001, upload a document, and start asking questions.
 
 ## API
 
-| Method | Path                   | Description                                                            |
-| ------ | ---------------------- | --------------------------------------------------------------------- |
-| POST   | `/upload`              | Upload a file (+ optional `tags`, `chat_id`); chunks, embeds, indexes. |
+| Method | Path                     | Description                                                               |
+| ------ | ------------------------ | ------------------------------------------------------------------------- |
+| POST   | `/upload`              | Upload a file (+ optional`tags`, `chat_id`); chunks, embeds, indexes. |
 | POST   | `/chat`                | `{ "question", "chat_id"? }` → streamed answer; persists the turn.     |
-| GET    | `/search`              | `?query=&chat_id=&limit=` → hybrid + reranked passages.               |
-| GET    | `/chats`               | List chat threads (newest first).                                      |
-| GET    | `/chats/{id}/messages` | Messages in a thread.                                                  |
-| GET    | `/documents`           | List indexed documents with tags + chunk counts.                      |
-| GET    | `/health`              | `{ "status": "ok" }`                                                   |
+| GET    | `/search`              | `?query=&chat_id=&limit=` → hybrid + reranked passages.                |
+| GET    | `/chats`               | List chat threads (newest first).                                         |
+| GET    | `/chats/{id}/messages` | Messages in a thread.                                                     |
+| GET    | `/documents`           | List indexed documents with tags + chunk counts.                          |
+| GET    | `/health`              | `{ "status": "ok" }`                                                    |
 
 `/chat` returns the thread id in the `X-Chat-Id` response header so the client can keep
 appending to the same conversation.

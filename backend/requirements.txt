@@ -3,6 +3,12 @@ uvicorn
 python-multipart
 qdrant-client
 openai
+# Generation via LangChain (LCEL + ChatOpenAI → vLLM).
+# ponytail: langchain-core + langchain-openai ONLY. Not the langchain meta-package,
+# langchain-community, or langchain-qdrant — native Qdrant RRF + FlagReranker + BGE-M3
+# chunking are kept (LC wrappers do them worse). Bump both together.
+langchain-core
+langchain-openai
 pypdf2
 psycopg[binary]
 python-dotenv

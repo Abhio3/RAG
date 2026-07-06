@@ -1,11 +1,11 @@
 import { useRef, useState, useEffect, type FormEvent, type ChangeEvent } from "react";
-import { streamChat, streamResearch, getMessages, uploadFile, getDocuments } from "../api";
+import { streamChat, getMessages, uploadFile, getDocuments } from "../api";
 
 type Mode = "chat" | "research" | "deep_research";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
-type Message = { role: "user" | "assistant"; content: string; error?: boolean };
+type Message = { role: "user" | "assistant"; content: string; reasoning?: string; error?: boolean };
 
 type Props = {
   chatId: string | null;
@@ -34,7 +34,9 @@ export default function ChatPanel({ chatId, onChatChanged }: Props) {
       getMessages(chatId),
       getDocuments(chatId)
     ]).then(([msgRows, docRows]) => {
-      setMessages(msgRows.map((r) => ({ role: r.role, content: r.content })));
+      setMessages(msgRows.map((r) => ({
+        role: r.role, content: r.content, reasoning: r.reasoning_content || undefined,
+      })));
       setSessionDocs(docRows.map((d) => d.filename));
     }).catch(() => {
       setMessages([]);
@@ -77,40 +79,34 @@ export default function ChatPanel({ chatId, onChatChanged }: Props) {
     setLoading(true);
     setSteps([]);
 
+    // Ensure an assistant bubble exists (created on the first token/reasoning/error,
+    // whichever arrives first) and update it.
     let started = false;
-    const appendToken = (chunk: string) => {
-      setMessages((m) => {
+    const updateAssistant = (fn: (m: Message) => Message) => {
+      setMessages((msgs) => {
         if (!started) {
           started = true;
-          return [...m, { role: "assistant", content: chunk }];
+          return [...msgs, fn({ role: "assistant", content: "" })];
         }
-        const copy = [...m];
-        copy[copy.length - 1] = {
-          role: "assistant",
-          content: copy[copy.length - 1].content + chunk,
-        };
+        const copy = [...msgs];
+        copy[copy.length - 1] = fn(copy[copy.length - 1]);
         return copy;
       });
     };
 
     try {
-      let newId: string;
-      if (mode === "chat") {
-        newId = await streamChat(question, chatId, appendToken);
-      } else {
-        newId = await streamResearch(question, chatId, mode, (ev) => {
-          if (ev.type === "token") appendToken(ev.text);
-          else if (ev.type === "plan") setSteps((s) => [...s, `Plan: ${ev.questions.join(" · ")}`]);
-          else if (ev.type === "status" || ev.type === "step") setSteps((s) => [...s, ev.text]);
-          else if (ev.type === "done") setSteps([]);
-        });
-      }
+      const newId = await streamChat(question, chatId, mode, (ev) => {
+        if (ev.type === "token") updateAssistant((m) => ({ ...m, content: m.content + ev.text }));
+        else if (ev.type === "reasoning") updateAssistant((m) => ({ ...m, reasoning: (m.reasoning || "") + ev.text }));
+        else if (ev.type === "error") updateAssistant((m) => ({ ...m, content: m.content || ev.text, error: true }));
+        else if (ev.type === "plan") setSteps((s) => [...s, `Plan: ${ev.questions.join(" · ")}`]);
+        else if (ev.type === "status" || ev.type === "step") setSteps((s) => [...s, ev.text]);
+        else if (ev.type === "done") setSteps([]);
+      });
       if (newId && newId !== chatId) onChatChanged(newId);
     } catch (err) {
-      setMessages((m) => [
-        ...m,
-        { role: "assistant", content: (err as Error).message, error: true },
-      ]);
+      // Pre-response failure (server unreachable / non-2xx) — no bubble started yet.
+      setMessages((m) => [...m, { role: "assistant", content: (err as Error).message, error: true }]);
     } finally {
       setLoading(false);
       setSteps([]);
@@ -154,8 +150,18 @@ export default function ChatPanel({ chatId, onChatChanged }: Props) {
           {messages.map((m, i) => (
             <div
               key={i}
-              className={`flex w-full ${m.role === "user" ? "justify-end" : "justify-start"} animate-fade-in`}
+              className={`flex w-full flex-col gap-1 ${m.role === "user" ? "items-end" : "items-start"} animate-fade-in`}
             >
+              <span className="px-1 text-[10px] font-semibold uppercase tracking-wider text-neutral-500">
+                {m.role === "user" ? "You" : "Assistant"}
+              </span>
+              {/* Reasoning trace: distinct, collapsed by default, never mixed into the answer. */}
+              {m.role === "assistant" && m.reasoning && (
+                <details className="max-w-[80%] rounded-xl bg-neutral-950/60 px-3 py-2 text-xs ring-1 ring-neutral-800/60">
+                  <summary className="cursor-pointer select-none font-medium text-neutral-500">Thoughts</summary>
+                  <div className="mt-2 whitespace-pre-wrap text-neutral-400">{m.reasoning}</div>
+                </details>
+              )}
               <div
                 className={`max-w-[80%] rounded-2xl px-5 py-3 shadow-md ${
                   m.role === "user"
